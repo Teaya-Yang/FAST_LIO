@@ -126,6 +126,9 @@ V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
 
+// Add global variable to store gyro message
+V3D latest_gyro(Zero3d);
+
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
@@ -358,6 +361,11 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 
     last_timestamp_imu = timestamp;
 
+    // Make gyro message global
+    latest_gyro(0) = msg->angular_velocity.x;
+    latest_gyro(1) = msg->angular_velocity.y;
+    latest_gyro(2) = msg->angular_velocity.z;
+
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
@@ -586,15 +594,35 @@ void set_posestamp(T & out)
     
 }
 
+// Add block to update twist
+template<typename T>
+void set_twist(T & out)
+{
+    V3D vel_body = state_point.rot.conjugate() * state_point.vel;
+    out.twist.linear.x = vel_body(0);
+    out.twist.linear.y = vel_body(1);
+    out.twist.linear.z = vel_body(2);
+
+    V3D omega_body = latest_gyro - state_point.bg;
+    out.twist.angular.x = omega_body(0);
+    out.twist.angular.y = omega_body(1);
+    out.twist.angular.z = omega_body(2);
+
+    
+}
+
 void publish_odometry(const ros::Publisher & pubOdomAftMapped)
 {
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
+
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped.publish(odomAftMapped);
+    set_twist(odomAftMapped.twist);
+
     auto P = kf.get_P();
-    for (int i = 0; i < 6; i ++)
+
+    for (int i = 0; i < 6; i++)
     {
         int k = i < 3 ? i + 3 : i - 3;
         odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
@@ -604,6 +632,29 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+
+    // ----- Clear twist covariance
+    for(int i = 0; i < 36; i++)
+        odomAftMapped.twist.covariance[i] = 0.0;
+
+    // ----- Rotate linear velocity covariance to body frame
+    Eigen::Matrix3d R = state_point.rot.toRotationMatrix();
+    Eigen::Matrix3d Sigma_v_world = P.block<3,3>(6,6);
+    Eigen::Matrix3d Sigma_v_body = R.transpose() * Sigma_v_world * R;
+
+    for(int r = 0; r < 3; r++)
+        for(int c = 0; c < 3; c++)
+            odomAftMapped.twist.covariance[r*6 + c] =
+                Sigma_v_body(r,c);
+
+    // ----- Angular velocity covariance (from gyro bias block)
+    for(int r = 0; r < 3; r++)
+        for(int c = 0; c < 3; c++)
+            odomAftMapped.twist.covariance[(r+3)*6 + (c+3)] =
+                P(r+9, c+9);
+
+
+    pubOdomAftMapped.publish(odomAftMapped); // This was before get_P which doesn't make sense I think
 
     static tf::TransformBroadcaster br;
     tf::Transform                   transform;
