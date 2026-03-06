@@ -598,10 +598,14 @@ void set_posestamp(T & out)
 template<typename T>
 void set_twist(T & out)
 {
-    V3D vel_body = state_point.rot.conjugate() * state_point.vel;
-    out.twist.linear.x = vel_body(0);
-    out.twist.linear.y = vel_body(1);
-    out.twist.linear.z = vel_body(2);
+    // V3D vel_body = state_point.rot.conjugate() * state_point.vel;
+    // out.twist.linear.x = vel_body(0);
+    // out.twist.linear.y = vel_body(1);
+    // out.twist.linear.z = vel_body(2);
+
+    out.twist.linear.x = state_point.vel(0);
+    out.twist.linear.y = state_point.vel(1);
+    out.twist.linear.z = state_point.vel(2);
 
     V3D omega_body = latest_gyro - state_point.bg;
     out.twist.angular.x = omega_body(0);
