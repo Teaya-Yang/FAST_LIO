@@ -194,6 +194,14 @@ Visualization Manager:
           Value: true
       Enabled: true
       Name: Odometry
+    - Class: rviz/Marker
+      Enabled: true
+      Marker Topic: /plane_normals
+      Name: PlaneNormals
+      Namespaces:
+        plane_normals: true
+      Queue Size: 100
+      Value: true
     - Class: rviz/Axes
       Enabled: true
       Length: 0.699999988079071

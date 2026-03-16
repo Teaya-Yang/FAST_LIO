@@ -129,6 +129,12 @@ M3D Lidar_R_wrt_IMU(Eye3d);
 // Add global variable to store gyro message
 V3D latest_gyro(Zero3d);
 
+// Add global variables for plane points and normals
+pcl::PointCloud<pcl::PointXYZ>::Ptr plane_points(
+    new pcl::PointCloud<pcl::PointXYZ>());
+pcl::PointCloud<pcl::PointXYZ>::Ptr plane_normals(
+    new pcl::PointCloud<pcl::PointXYZ>());
+
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
@@ -581,6 +587,43 @@ void publish_map(const ros::Publisher & pubLaserCloudMap)
     pubLaserCloudMap.publish(laserCloudMap);
 }
 
+void publish_plane_normal_markers(const ros::Publisher &pubMarkers)
+{
+    if (plane_points->empty() || plane_normals->empty())
+        return;
+    visualization_msgs::Marker marker;
+    marker.header.stamp    = ros::Time().fromSec(lidar_end_time);
+    marker.header.frame_id = "camera_init";
+    marker.ns   = "plane_normals";
+    marker.id   = 0;
+    marker.type = visualization_msgs::Marker::LINE_LIST;
+    marker.action = visualization_msgs::Marker::ADD;
+    // Line thickness
+    marker.scale.x = 0.03;
+    // Color (red)
+    marker.color.r = 1.0;
+    marker.color.g = 0.0;
+    marker.color.b = 0.0;
+    marker.color.a = 1.0;
+    const double normal_scale = 0.3;  // arrow length
+    marker.points.reserve(plane_points->size() * 2);
+    for (size_t i = 0; i < plane_points->size() && i < plane_normals->size(); ++i)
+    {
+        geometry_msgs::Point p_start, p_end;
+        const auto &p = plane_points->points[i];
+        const auto &n = plane_normals->points[i];
+        p_start.x = p.x;
+        p_start.y = p.y;
+        p_start.z = p.z;
+        p_end.x = p.x + normal_scale * n.x;
+        p_end.y = p.y + normal_scale * n.y;
+        p_end.z = p.z + normal_scale * n.z;
+        marker.points.push_back(p_start);
+        marker.points.push_back(p_end);
+    }
+    pubMarkers.publish(marker);
+}
+
 template<typename T>
 void set_posestamp(T & out)
 {
@@ -697,6 +740,10 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     corr_normvect->clear(); 
     total_residual = 0.0; 
 
+    // Clear plane visualization clouds for this iteration
+    plane_points->clear();
+    plane_normals->clear();
+
     /** closest surface search and residual computation **/
     #ifdef MP_EN
         omp_set_num_threads(MP_PROC_NUM);
@@ -743,6 +790,21 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                 normvec->points[i].z = pabcd(2);
                 normvec->points[i].intensity = pd2;
                 res_last[i] = abs(pd2);
+
+                //Store plane points and normals for visualization
+
+                V3D n(pabcd(0), pabcd(1), pabcd(2));
+                V3D p(point_world.x, point_world.y, point_world.z);
+
+                V3D p0 = p - (n.dot(p) + pabcd(3)) * n / n.squaredNorm();
+
+                #pragma omp critical
+                {
+                    plane_points->points.push_back(
+                        pcl::PointXYZ(p0.x(), p0.y(), p0.z()));
+                    plane_normals->points.push_back(
+                        pcl::PointXYZ(n.x(), n.y(), n.z()));
+                }
             }
         }
     }
@@ -913,6 +975,8 @@ int main(int argc, char** argv)
             ("/Odometry", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
+    ros::Publisher pubPlaneNormals  = nh.advertise<visualization_msgs::Marker>
+            ("/plane_normals", 100000);
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
     ros::Rate rate(5000);
@@ -978,7 +1042,7 @@ int main(int argc, char** argv)
             int featsFromMapNum = ikdtree.validnum();
             kdtree_size_st = ikdtree.size();
             
-            // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
+            cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
 
             /*** ICP and iterated Kalman filter update ***/
             if (feats_down_size < 5)
@@ -1025,7 +1089,7 @@ int main(int argc, char** argv)
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
-
+            publish_plane_normal_markers(pubPlaneNormals);
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
             map_incremental();
