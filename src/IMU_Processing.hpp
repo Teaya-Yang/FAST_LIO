@@ -51,6 +51,17 @@ class ImuProcess
   void set_acc_bias_cov(const V3D &b_a);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
+  // IMU-only propagation for a single IMU measurement, used for IMU-rate odometry.
+  // This mirrors the forward integration logic in UndistortPcl.
+  void PropagateSingleImu(const sensor_msgs::ImuConstPtr &imu,
+                          esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state);
+  // Reset the internal IMU-only time reference used for IMU-rate odometry.
+  // Call this when you synchronize the IMU EKF with the LiDAR-updated state.
+  void ImuOdomReset(double t_ref);
+  /** True after map-side IMU gravity/bias init (Process) has finished. */
+  bool is_imu_init_finished() const { return !imu_need_init_; }
+  /** Copy calibration from map ImuProcess so odom-only instance can PropagateSingleImu. */
+  void copy_imu_odom_calibration_from(const ImuProcess &map_proc);
 
   ofstream fout_imu;
   V3D cov_acc;
@@ -67,7 +78,10 @@ class ImuProcess
   void UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI &pcl_in_out);
 
   PointCloudXYZI::Ptr cur_pcl_un_;
+  /** Last IMU sample for UndistortPcl only (bridge between scans). Do not use for IMU-odom. */
   sensor_msgs::ImuConstPtr last_imu_;
+  /** Previous IMU for PropagateSingleImu / kf_imu only — never touches UndistortPcl. */
+  sensor_msgs::ImuConstPtr last_imu_imu_odom_;
   deque<sensor_msgs::ImuConstPtr> v_imu_;
   vector<Pose6D> IMUpose;
   vector<M3D>    v_rot_pcl_;
@@ -79,6 +93,10 @@ class ImuProcess
   V3D acc_s_last;
   double start_timestamp_;
   double last_lidar_end_time_;
+  // For IMU-only odometry propagation (kf_imu): separate time base so that
+  // dt is computed purely from IMU timestamps, independent of sync_packages.
+  double imu_only_last_time_;
+  bool   imu_only_ready_;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -99,6 +117,9 @@ ImuProcess::ImuProcess()
   Lidar_T_wrt_IMU = Zero3d;
   Lidar_R_wrt_IMU = Eye3d;
   last_imu_.reset(new sensor_msgs::Imu());
+  last_imu_imu_odom_.reset();
+  imu_only_last_time_ = 0.0;
+  imu_only_ready_     = false;
 }
 
 ImuProcess::~ImuProcess() {}
@@ -115,7 +136,10 @@ void ImuProcess::Reset()
   v_imu_.clear();
   IMUpose.clear();
   last_imu_.reset(new sensor_msgs::Imu());
+  last_imu_imu_odom_.reset();
   cur_pcl_un_.reset(new PointCloudXYZI());
+  imu_only_last_time_ = 0.0;
+  imu_only_ready_     = false;
 }
 
 void ImuProcess::set_extrinsic(const MD(4,4) &T)
@@ -154,6 +178,101 @@ void ImuProcess::set_gyr_bias_cov(const V3D &b_g)
 void ImuProcess::set_acc_bias_cov(const V3D &b_a)
 {
   cov_bias_acc = b_a;
+}
+
+void ImuProcess::ImuOdomReset(double t_ref)
+{
+  // Called when kf_imu is snapped to the LiDAR-updated state.
+  imu_only_last_time_ = t_ref;
+  imu_only_ready_     = true;
+  // IMU-odom chain only — do NOT clear last_imu_ (UndistortPcl bridge).
+  last_imu_imu_odom_.reset();
+}
+
+void ImuProcess::copy_imu_odom_calibration_from(const ImuProcess &map_proc)
+{
+  if (map_proc.imu_need_init_)
+    return;
+  mean_acc       = map_proc.mean_acc;
+  mean_gyr       = map_proc.mean_gyr;
+  cov_acc        = map_proc.cov_acc;
+  cov_gyr        = map_proc.cov_gyr;
+  cov_acc_scale  = map_proc.cov_acc_scale;
+  cov_gyr_scale  = map_proc.cov_gyr_scale;
+  cov_bias_gyr   = map_proc.cov_bias_gyr;
+  cov_bias_acc   = map_proc.cov_bias_acc;
+  first_lidar_time = map_proc.first_lidar_time;
+  imu_need_init_ = false;
+  last_imu_imu_odom_.reset();
+  imu_only_ready_     = false;
+  imu_only_last_time_ = 0.0;
+}
+
+void ImuProcess::PropagateSingleImu(
+    const sensor_msgs::ImuConstPtr &imu,
+    esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state)
+{
+  // Skip propagation until:
+  //  - the main IMU initialization (via LiDAR loop) is done, and
+  //  - we have explicitly synchronized kf_imu with the LiDAR-updated state
+  //    via ImuOdomReset.
+  if (imu_need_init_ || !imu_only_ready_) {
+    return;
+  }
+
+  // We need a valid previous IMU sample to form a head/tail pair.
+  if (!last_imu_imu_odom_) {
+    last_imu_imu_odom_ = imu;
+    return;
+  }
+
+  const double t_head = last_imu_imu_odom_->header.stamp.toSec();
+  const double t_tail = imu->header.stamp.toSec();
+
+  // Enforce forward time progression between IMU samples.
+  if (t_tail <= t_head) {
+    last_imu_imu_odom_ = imu;
+    return;
+  }
+
+  // Simple trapezoidal averaging between the two IMU samples.
+  V3D angvel_avr, acc_avr;
+
+  angvel_avr << 0.5 * (last_imu_imu_odom_->angular_velocity.x + imu->angular_velocity.x),
+                0.5 * (last_imu_imu_odom_->angular_velocity.y + imu->angular_velocity.y),
+                0.5 * (last_imu_imu_odom_->angular_velocity.z + imu->angular_velocity.z);
+
+  acc_avr   << 0.5 * (last_imu_imu_odom_->linear_acceleration.x + imu->linear_acceleration.x),
+                0.5 * (last_imu_imu_odom_->linear_acceleration.y + imu->linear_acceleration.y),
+                0.5 * (last_imu_imu_odom_->linear_acceleration.z + imu->linear_acceleration.z);
+
+  // Apply the same gravity-related scaling used in UndistortPcl so that
+  // the IMU-only propagation sees accelerations with a consistent magnitude.
+  acc_avr = acc_avr * G_m_s2 / mean_acc.norm();
+
+  // dt is simply the time between these two IMU samples.
+  double dt = t_tail - t_head;
+  if (dt <= 0.0) {
+    last_imu_imu_odom_ = imu;
+    return;
+  }
+
+  input_ikfom in;
+  in.acc  = acc_avr;
+  in.gyro = angvel_avr;
+
+  // Use the same noise covariance structure as UndistortPcl.
+  Q.block<3, 3>(0, 0).diagonal() = cov_gyr;
+  Q.block<3, 3>(3, 3).diagonal() = cov_acc;
+  Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
+  Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
+
+  kf_state.predict(dt, Q, in);
+
+  // Do not touch angvel_last / acc_s_last here — those belong to UndistortPcl only.
+
+  last_imu_imu_odom_ = imu;
+  imu_only_last_time_ = t_tail;
 }
 
 void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, int &N)
