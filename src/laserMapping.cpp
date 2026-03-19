@@ -87,9 +87,7 @@ bool kf_imu_sync_pending = false;
 state_ikfom pending_kf_imu_x;
 esekfom::esekf<state_ikfom, 12, input_ikfom>::cov pending_kf_imu_P;
 double pending_lidar_end_t = 0.0;
-mutex mtx_imu_odom_queue;
-condition_variable imu_odom_cv;
-deque<sensor_msgs::Imu::ConstPtr> imu_odom_queue;
+// Protect latest_gyro used for /Odometry twist.
 mutex mtx_latest_gyro;
 
 string root_dir = ROOT_DIR;
@@ -391,13 +389,73 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
         latest_gyro(2) = msg->angular_velocity.z;
     }
 
+    // --- IMU-rate EKF propagation + odom publish on this dedicated IMU queue thread ---
     {
-        std::lock_guard<std::mutex> lk(mtx_imu_odom_queue);
-        if (imu_loop_back)
-            imu_odom_queue.clear();
-        imu_odom_queue.push_back(msg);
-        imu_odom_cv.notify_one();
+        // Apply any pending LiDAR sync to kf_imu.
+        std::lock_guard<std::mutex> pend_lk(mtx_kf_imu_pending);
+        if (kf_imu_sync_pending)
+        {
+            kf_imu.change_x(pending_kf_imu_x);
+            kf_imu.change_P(pending_kf_imu_P);
+            p_imu_odom->ImuOdomReset(pending_lidar_end_t);
+            kf_imu_sync_pending = false;
+        }
     }
+
+    // Wall-clock spacing of IMU callbacks (for debugging burstiness)
+    static ros::Time last_imu_cb_time;
+    {
+        ros::Time now_cb = ros::Time::now();
+        if (!last_imu_cb_time.isZero())
+        {
+            double dt_cb = (now_cb - last_imu_cb_time).toSec();
+            ROS_INFO_STREAM_THROTTLE(1.0, "[imu_cbk] wall dt = " << dt_cb);
+        }
+        last_imu_cb_time = now_cb;
+    }
+
+    p_imu_odom->PropagateSingleImu(msg, kf_imu);
+    state_ikfom imu_state = kf_imu.get_x();
+
+    nav_msgs::Odometry odomImu;
+    odomImu.header.frame_id = "camera_init";
+    odomImu.child_frame_id  = "body";
+    odomImu.header.stamp    = msg->header.stamp;
+
+    odomImu.pose.pose.position.x = imu_state.pos(0);
+    odomImu.pose.pose.position.y = imu_state.pos(1);
+    odomImu.pose.pose.position.z = imu_state.pos(2);
+
+    odomImu.pose.pose.orientation.x = imu_state.rot.coeffs()[0];
+    odomImu.pose.pose.orientation.y = imu_state.rot.coeffs()[1];
+    odomImu.pose.pose.orientation.z = imu_state.rot.coeffs()[2];
+    odomImu.pose.pose.orientation.w = imu_state.rot.coeffs()[3];
+
+    odomImu.twist.twist.linear.x = imu_state.vel(0);
+    odomImu.twist.twist.linear.y = imu_state.vel(1);
+    odomImu.twist.twist.linear.z = imu_state.vel(2);
+
+    V3D omega_body;
+    omega_body << msg->angular_velocity.x - imu_state.bg(0),
+        msg->angular_velocity.y - imu_state.bg(1),
+        msg->angular_velocity.z - imu_state.bg(2);
+    odomImu.twist.twist.angular.x = omega_body(0);
+    odomImu.twist.twist.angular.y = omega_body(1);
+    odomImu.twist.twist.angular.z = omega_body(2);
+
+    // Wall-clock spacing of Odometry_imu publishes (for debugging)
+    static ros::Time last_odomimu_pub_time;
+    {
+        ros::Time now_pub = ros::Time::now();
+        if (!last_odomimu_pub_time.isZero())
+        {
+            double dt_pub = (now_pub - last_odomimu_pub_time).toSec();
+            ROS_INFO_STREAM_THROTTLE(1.0, "[Odometry_imu] wall dt = " << dt_pub);
+        }
+        last_odomimu_pub_time = now_pub;
+    }
+
+    pubOdomImu.publish(odomImu);
 
     sig_buffer.notify_all();
 }
@@ -1038,88 +1096,8 @@ int main(int argc, char** argv)
         }
     });
 
-    auto process_imu_odom_msg = [&](const sensor_msgs::Imu::ConstPtr &msg) {
-        {
-            std::lock_guard<std::mutex> pend_lk(mtx_kf_imu_pending);
-            if (kf_imu_sync_pending)
-            {
-                kf_imu.change_x(pending_kf_imu_x);
-                kf_imu.change_P(pending_kf_imu_P);
-                p_imu_odom->ImuOdomReset(pending_lidar_end_t);
-                kf_imu_sync_pending = false;
-            }
-        }
-        p_imu_odom->PropagateSingleImu(msg, kf_imu);
-        state_ikfom imu_state = kf_imu.get_x();
-
-        nav_msgs::Odometry odomImu;
-        odomImu.header.frame_id = "camera_init";
-        odomImu.child_frame_id = "body";
-        odomImu.header.stamp = msg->header.stamp;
-
-        odomImu.pose.pose.position.x = imu_state.pos(0);
-        odomImu.pose.pose.position.y = imu_state.pos(1);
-        odomImu.pose.pose.position.z = imu_state.pos(2);
-
-        odomImu.pose.pose.orientation.x = imu_state.rot.coeffs()[0];
-        odomImu.pose.pose.orientation.y = imu_state.rot.coeffs()[1];
-        odomImu.pose.pose.orientation.z = imu_state.rot.coeffs()[2];
-        odomImu.pose.pose.orientation.w = imu_state.rot.coeffs()[3];
-
-        odomImu.twist.twist.linear.x = imu_state.vel(0);
-        odomImu.twist.twist.linear.y = imu_state.vel(1);
-        odomImu.twist.twist.linear.z = imu_state.vel(2);
-
-        V3D omega_body;
-        omega_body << msg->angular_velocity.x - imu_state.bg(0),
-            msg->angular_velocity.y - imu_state.bg(1),
-            msg->angular_velocity.z - imu_state.bg(2);
-        odomImu.twist.twist.angular.x = omega_body(0);
-        odomImu.twist.twist.angular.y = omega_body(1);
-        odomImu.twist.twist.angular.z = omega_body(2);
-
-        pubOdomImu.publish(odomImu);
-    };
-
-    std::thread imu_odom_thread([&]() {
-        for (;;)
-        {
-            sensor_msgs::Imu::ConstPtr msg;
-            {
-                std::unique_lock<std::mutex> lk(mtx_imu_odom_queue);
-                imu_odom_cv.wait(lk, [&] {
-                    return !imu_odom_queue.empty() || flg_exit || !ros::ok();
-                });
-                if (imu_odom_queue.empty())
-                {
-                    lk.unlock();
-                    if (flg_exit || !ros::ok())
-                        break;
-                    continue;
-                }
-                msg = imu_odom_queue.front();
-                imu_odom_queue.pop_front();
-                size_t qsz = imu_odom_queue.size();
-                lk.unlock();
-                if (qsz > 50)
-                    ROS_WARN_THROTTLE(2.0, "[Odometry_imu] queue backlog: %zu (odom thread not keeping up)",
-                                      qsz);
-            }
-            process_imu_odom_msg(msg);
-        }
-        for (;;)
-        {
-            sensor_msgs::Imu::ConstPtr msg;
-            {
-                std::lock_guard<std::mutex> lk(mtx_imu_odom_queue);
-                if (imu_odom_queue.empty())
-                    break;
-                msg = imu_odom_queue.front();
-                imu_odom_queue.pop_front();
-            }
-            process_imu_odom_msg(msg);
-        }
-    });
+    // No dedicated odom thread any more: imu_cbk runs on its own queue/thread and
+    // performs propagation + publish directly.
 
     ros::Rate rate(5000);
     bool status = ros::ok();
@@ -1307,12 +1285,9 @@ int main(int argc, char** argv)
     }
 
     flg_exit = true;
-    imu_odom_cv.notify_all();
     if (imu_callback_thread.joinable())
         imu_callback_thread.join();
     spinner.stop();
-    if (imu_odom_thread.joinable())
-        imu_odom_thread.join();
 
     /**************** save map ****************/
     /* 1. make sure you have enough memories
