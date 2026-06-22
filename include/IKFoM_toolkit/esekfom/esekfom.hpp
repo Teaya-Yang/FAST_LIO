@@ -115,9 +115,9 @@ public:
 	typedef typename state::scalar scalar_type;
 	typedef Matrix<scalar_type, n, n> cov;
 	typedef Matrix<scalar_type, m, n> cov_;
-	typedef SparseMatrix<scalar_type> spMt;
-	typedef Matrix<scalar_type, n, 1> vectorized_state;
-	typedef Matrix<scalar_type, m, 1> flatted_state;
+		typedef SparseMatrix<scalar_type> spMt;
+		typedef Matrix<scalar_type, n, 1> vectorized_state;
+		typedef Matrix<scalar_type, m, 1> flatted_state;
 	typedef flatted_state processModel(state &, const input &);
 	typedef Eigen::Matrix<scalar_type, m, n> processMatrix1(state &, const input &);
 	typedef Eigen::Matrix<scalar_type, m, process_noise_dof> processMatrix2(state &, const input &);
@@ -131,8 +131,17 @@ public:
 	typedef Eigen::Matrix<scalar_type , Eigen::Dynamic, n> measurementMatrix1_dyn(state &, bool&);
 	typedef Eigen::Matrix<scalar_type ,l, measurement_noise_dof> measurementMatrix2(state &, bool&);
 	typedef Eigen::Matrix<scalar_type ,Eigen::Dynamic, Eigen::Dynamic> measurementMatrix2_dyn(state &, bool&);
-	typedef Eigen::Matrix<scalar_type, measurement_noise_dof, measurement_noise_dof> measurementnoisecovariance;
-	typedef Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> measurementnoisecovariance_dyn;
+		typedef Eigen::Matrix<scalar_type, measurement_noise_dof, measurement_noise_dof> measurementnoisecovariance;
+		typedef Eigen::Matrix<scalar_type, Eigen::Dynamic, Eigen::Dynamic> measurementnoisecovariance_dyn;
+
+		struct dyn_update_diagnostics {
+			bool valid = false;
+			int measurement_dof = 0;
+			scalar_type measurement_noise = scalar_type(0);
+			Eigen::Matrix<scalar_type, Eigen::Dynamic, 1> residual;
+			Eigen::Matrix<scalar_type, Eigen::Dynamic, 12> h_x;
+			cov prior_cov = cov::Zero();
+		};
 
 	esekf(const state &x = state(),
 		const cov  &P = cov::Identity()): x_(x), P_(P){
@@ -363,7 +372,7 @@ public:
 			
 			for(int i = 0; i < n; i++){
 				f_x_final. template block<2, 1>(idx, i) = res_temp_S2 * (f_x_. template block<3, 1>(dim, i));
-				
+
 			}
 			for(int i = 0; i < process_noise_dof; i++){
 				f_w_final. template block<2, 1>(idx, i) = res_temp_S2 * (f_w_. template block<3, 1>(dim, i));
@@ -1615,11 +1624,12 @@ public:
 		}
 	}
 	
-	//iterated error state EKF update modified for one specific system.
-	void update_iterated_dyn_share_modified(double R, double &solve_time) {
-		
-		dyn_share_datastruct<scalar_type> dyn_share;
-		dyn_share.valid = true;
+		//iterated error state EKF update modified for one specific system.
+		void update_iterated_dyn_share_modified(double R, double &solve_time) {
+
+			last_dyn_update_diag_.valid = false;
+			dyn_share_datastruct<scalar_type> dyn_share;
+			dyn_share.valid = true;
 		dyn_share.converge = true;
 		int t = 0;
 		state x_propagated = x_;
@@ -1677,8 +1687,8 @@ public:
 
 			Matrix<scalar_type, 2, 2> res_temp_S2;
 			MTK::vect<2, scalar_type> seg_S2;
-			for (std::vector<std::pair<int, int> >::iterator it = x_.S2_state.begin(); it != x_.S2_state.end(); it++) {
-				int idx = (*it).first;
+				for (std::vector<std::pair<int, int> >::iterator it = x_.S2_state.begin(); it != x_.S2_state.end(); it++) {
+					int idx = (*it).first;
 				int dim = (*it).second;
 				for(int i = 0; i < 2; i++){
 					seg_S2(i) = dx(idx + i);
@@ -1695,11 +1705,21 @@ public:
 				}
 				for(int i = 0; i < n; i++){
 					P_. template block<1, 2>(i, idx) = (P_. template block<1, 2>(i, idx)) * res_temp_S2.transpose();
+					}
 				}
-			}
-			//Matrix<scalar_type, n, Eigen::Dynamic> K_;
-			//Matrix<scalar_type, n, 1> K_h;
-			//Matrix<scalar_type, n, n> K_x; 
+
+				if(!last_dyn_update_diag_.valid)
+				{
+					last_dyn_update_diag_.valid = true;
+					last_dyn_update_diag_.measurement_dof = dof_Measurement;
+					last_dyn_update_diag_.measurement_noise = R;
+					last_dyn_update_diag_.residual = dyn_share.h;
+					last_dyn_update_diag_.h_x = dyn_share.h_x;
+					last_dyn_update_diag_.prior_cov = P_;
+				}
+				//Matrix<scalar_type, n, Eigen::Dynamic> K_;
+				//Matrix<scalar_type, n, 1> K_h;
+				//Matrix<scalar_type, n, n> K_x;
 
 			/*
 			if(n > dof_Measurement)
@@ -1949,19 +1969,23 @@ public:
 	const state& get_x() const {
 		return x_;
 	}
-	const cov& get_P() const {
-		return P_;
-	}
-private:
-	state x_;
+		const cov& get_P() const {
+			return P_;
+		}
+		const dyn_update_diagnostics& get_last_dyn_update_diagnostics() const {
+			return last_dyn_update_diag_;
+		}
+	private:
+		state x_;
 	measurement m_;
 	cov P_;
 	spMt l_;
 	spMt f_x_1;
 	spMt f_x_2;
 	cov F_x1 = cov::Identity();
-	cov F_x2 = cov::Identity();
-	cov L_ = cov::Identity();
+		cov F_x2 = cov::Identity();
+		cov L_ = cov::Identity();
+		dyn_update_diagnostics last_dyn_update_diag_;
 
 	processModel *f;
 	processMatrix1 *f_x;

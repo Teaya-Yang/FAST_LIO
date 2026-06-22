@@ -33,6 +33,7 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
+#include <cmath>
 #include <mutex>
 #include <math.h>
 #include <thread>
@@ -57,6 +58,7 @@
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <geometry_msgs/Vector3.h>
+#include <fast_lio/EstimatorMetrics.h>
 #include <livox_ros_driver2/CustomMsg.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
@@ -66,12 +68,24 @@
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
 
+using EkfCov = esekfom::esekf<state_ikfom, 12, input_ikfom>::cov;
+
+constexpr int IKFOM_IDX_POS = 0;
+constexpr int IKFOM_IDX_ROT = 3;
+constexpr int IKFOM_IDX_OFFSET_R = 6;
+constexpr int IKFOM_IDX_OFFSET_T = 9;
+constexpr int IKFOM_IDX_VEL = 12;
+constexpr int IKFOM_IDX_BG = 15;
+constexpr int IKFOM_IDX_BA = 18;
+constexpr int IKFOM_IDX_GRAV = 21;
+constexpr int IKFOM_ACTIVE_MEAS_DOF = 12;
+
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN], s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
-bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true, gravity_align_en = true;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -156,6 +170,7 @@ nav_msgs::Path path;
 nav_msgs::Odometry odomAftMapped;
 // Publisher for IMU-rate odometry
 ros::Publisher pubOdomImu;
+ros::Publisher pubEstimatorMetrics;
 geometry_msgs::Quaternion geoQuat;
 geometry_msgs::PoseStamped msg_body_pose;
 
@@ -357,6 +372,85 @@ void livox_pcl_cbk(const livox_ros_driver2::CustomMsg::ConstPtr &msg)
     sig_buffer.notify_all();
 }
 
+inline int ros_pose_cov_index_to_state_index(int idx)
+{
+    return idx < 3 ? IKFOM_IDX_POS + idx : IKFOM_IDX_ROT + idx - 3;
+}
+
+template<typename CovArray>
+void clear_ros_covariance(CovArray &cov)
+{
+    for (size_t i = 0; i < cov.size(); i++)
+    {
+        cov[i] = 0.0;
+    }
+}
+
+template<typename CovArray>
+void fill_ros_pose_covariance(const EkfCov &P, CovArray &cov)
+{
+    clear_ros_covariance(cov);
+    for (int r = 0; r < 6; r++)
+    {
+        const int state_r = ros_pose_cov_index_to_state_index(r);
+        for (int c = 0; c < 6; c++)
+        {
+            const int state_c = ros_pose_cov_index_to_state_index(c);
+            cov[r * 6 + c] = P(state_r, state_c);
+        }
+    }
+}
+
+template<typename CovArray>
+void fill_ros_twist_covariance(const state_ikfom &s, const EkfCov &P, CovArray &cov)
+{
+    clear_ros_covariance(cov);
+    const M3D R = s.rot.toRotationMatrix();
+    const M3D sigma_v_world = P.block<3, 3>(IKFOM_IDX_VEL, IKFOM_IDX_VEL);
+    const M3D sigma_v_body = R.transpose() * sigma_v_world * R;
+
+    for (int r = 0; r < 3; r++)
+    {
+        for (int c = 0; c < 3; c++)
+        {
+            cov[r * 6 + c] = sigma_v_body(r, c);
+            cov[(r + 3) * 6 + (c + 3)] = P(IKFOM_IDX_BG + r, IKFOM_IDX_BG + c);
+        }
+    }
+}
+
+void fill_odometry_msg(nav_msgs::Odometry &odom,
+                       const state_ikfom &s,
+                       const EkfCov &P,
+                       const ros::Time &stamp,
+                       const V3D &gyro)
+{
+    odom.header.frame_id = "camera_init";
+    odom.child_frame_id = "body";
+    odom.header.stamp = stamp;
+
+    odom.pose.pose.position.x = s.pos(0);
+    odom.pose.pose.position.y = s.pos(1);
+    odom.pose.pose.position.z = s.pos(2);
+    odom.pose.pose.orientation.x = s.rot.coeffs()[0];
+    odom.pose.pose.orientation.y = s.rot.coeffs()[1];
+    odom.pose.pose.orientation.z = s.rot.coeffs()[2];
+    odom.pose.pose.orientation.w = s.rot.coeffs()[3];
+
+    const V3D vel_body = s.rot.conjugate() * s.vel;
+    odom.twist.twist.linear.x = vel_body(0);
+    odom.twist.twist.linear.y = vel_body(1);
+    odom.twist.twist.linear.z = vel_body(2);
+
+    const V3D omega_body = gyro - s.bg;
+    odom.twist.twist.angular.x = omega_body(0);
+    odom.twist.twist.angular.y = omega_body(1);
+    odom.twist.twist.angular.z = omega_body(2);
+
+    fill_ros_pose_covariance(P, odom.pose.covariance);
+    fill_ros_twist_covariance(s, P, odom.twist.covariance);
+}
+
 void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 {
     publish_count++;
@@ -418,30 +512,9 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
     state_ikfom imu_state = kf_imu.get_x();
 
     nav_msgs::Odometry odomImu;
-    odomImu.header.frame_id = "camera_init";
-    odomImu.child_frame_id  = "body";
-    odomImu.header.stamp    = msg->header.stamp;
-
-    odomImu.pose.pose.position.x = imu_state.pos(0);
-    odomImu.pose.pose.position.y = imu_state.pos(1);
-    odomImu.pose.pose.position.z = imu_state.pos(2);
-
-    odomImu.pose.pose.orientation.x = imu_state.rot.coeffs()[0];
-    odomImu.pose.pose.orientation.y = imu_state.rot.coeffs()[1];
-    odomImu.pose.pose.orientation.z = imu_state.rot.coeffs()[2];
-    odomImu.pose.pose.orientation.w = imu_state.rot.coeffs()[3];
-
-    odomImu.twist.twist.linear.x = imu_state.vel(0);
-    odomImu.twist.twist.linear.y = imu_state.vel(1);
-    odomImu.twist.twist.linear.z = imu_state.vel(2);
-
-    V3D omega_body;
-    omega_body << msg->angular_velocity.x - imu_state.bg(0),
-        msg->angular_velocity.y - imu_state.bg(1),
-        msg->angular_velocity.z - imu_state.bg(2);
-    odomImu.twist.twist.angular.x = omega_body(0);
-    odomImu.twist.twist.angular.y = omega_body(1);
-    odomImu.twist.twist.angular.z = omega_body(2);
+    V3D gyro;
+    gyro << msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z;
+    fill_odometry_msg(odomImu, imu_state, kf_imu.get_P(), msg->header.stamp, gyro);
 
     // Wall-clock spacing of Odometry_imu publishes (for debugging)
     static ros::Time last_odomimu_pub_time;
@@ -724,76 +797,16 @@ void set_posestamp(T & out)
     
 }
 
-// Add block to update twist
-template<typename T>
-void set_twist(T & out)
+void publish_odometry(const ros::Publisher & pubOdomAftMapped)
 {
-    // V3D vel_body = state_point.rot.conjugate() * state_point.vel;
-    // out.twist.linear.x = vel_body(0);
-    // out.twist.linear.y = vel_body(1);
-    // out.twist.linear.z = vel_body(2);
-
-    out.twist.linear.x = state_point.vel(0);
-    out.twist.linear.y = state_point.vel(1);
-    out.twist.linear.z = state_point.vel(2);
-
     V3D gyr;
     {
         std::lock_guard<std::mutex> lk(mtx_latest_gyro);
         gyr = latest_gyro;
     }
-    V3D omega_body = gyr - state_point.bg;
-    out.twist.angular.x = omega_body(0);
-    out.twist.angular.y = omega_body(1);
-    out.twist.angular.z = omega_body(2);
+    fill_odometry_msg(odomAftMapped, state_point, kf.get_P(), ros::Time().fromSec(lidar_end_time), gyr);
 
-    
-}
-
-void publish_odometry(const ros::Publisher & pubOdomAftMapped)
-{
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
-    odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
-
-    set_posestamp(odomAftMapped.pose);
-    set_twist(odomAftMapped.twist);
-
-    auto P = kf.get_P();
-
-    for (int i = 0; i < 6; i++)
-    {
-        int k = i < 3 ? i + 3 : i - 3;
-        odomAftMapped.pose.covariance[i*6 + 0] = P(k, 3);
-        odomAftMapped.pose.covariance[i*6 + 1] = P(k, 4);
-        odomAftMapped.pose.covariance[i*6 + 2] = P(k, 5);
-        odomAftMapped.pose.covariance[i*6 + 3] = P(k, 0);
-        odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
-        odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
-    }
-
-    // ----- Clear twist covariance
-    for(int i = 0; i < 36; i++)
-        odomAftMapped.twist.covariance[i] = 0.0;
-
-    // ----- Rotate linear velocity covariance to body frame
-    Eigen::Matrix3d R = state_point.rot.toRotationMatrix();
-    Eigen::Matrix3d Sigma_v_world = P.block<3,3>(6,6);
-    Eigen::Matrix3d Sigma_v_body = R.transpose() * Sigma_v_world * R;
-
-    for(int r = 0; r < 3; r++)
-        for(int c = 0; c < 3; c++)
-            odomAftMapped.twist.covariance[r*6 + c] =
-                Sigma_v_body(r,c);
-
-    // ----- Angular velocity covariance (from gyro bias block)
-    for(int r = 0; r < 3; r++)
-        for(int c = 0; c < 3; c++)
-            odomAftMapped.twist.covariance[(r+3)*6 + (c+3)] =
-                P(r+9, c+9);
-
-
-    pubOdomAftMapped.publish(odomAftMapped); // This was before get_P which doesn't make sense I think
+    pubOdomAftMapped.publish(odomAftMapped);
 
     static tf::TransformBroadcaster br;
     tf::Transform                   transform;
@@ -807,6 +820,65 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
     q.setZ(odomAftMapped.pose.pose.orientation.z);
     transform.setRotation( q );
     br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "camera_init", "body" ) );
+}
+
+void publish_estimator_metrics(const ros::Publisher &pubMetrics, const ros::Time &stamp)
+{
+    const auto &diag = kf.get_last_dyn_update_diagnostics();
+    if (!diag.valid || diag.measurement_dof <= 0 || diag.measurement_noise <= 0.0)
+    {
+        return;
+    }
+
+    const Eigen::VectorXd &residual = diag.residual;
+    const Eigen::Matrix<double, Eigen::Dynamic, IKFOM_ACTIVE_MEAS_DOF> &H = diag.h_x;
+    const int dof = residual.rows();
+    if (dof <= 0 || H.rows() != dof || H.cols() != IKFOM_ACTIVE_MEAS_DOF)
+    {
+        return;
+    }
+
+    const double R = diag.measurement_noise;
+    const Eigen::Matrix<double, IKFOM_ACTIVE_MEAS_DOF, IKFOM_ACTIVE_MEAS_DOF> HtH = H.transpose() * H;
+    const Eigen::Matrix<double, IKFOM_ACTIVE_MEAS_DOF, IKFOM_ACTIVE_MEAS_DOF> fim = HtH / R;
+    const Eigen::Matrix<double, IKFOM_ACTIVE_MEAS_DOF, IKFOM_ACTIVE_MEAS_DOF> P_active =
+        diag.prior_cov.block<IKFOM_ACTIVE_MEAS_DOF, IKFOM_ACTIVE_MEAS_DOF>(0, 0);
+
+    const Eigen::Matrix<double, IKFOM_ACTIVE_MEAS_DOF, IKFOM_ACTIVE_MEAS_DOF> A =
+        Eigen::Matrix<double, IKFOM_ACTIVE_MEAS_DOF, IKFOM_ACTIVE_MEAS_DOF>::Identity() + (HtH * P_active) / R;
+    const Eigen::Matrix<double, IKFOM_ACTIVE_MEAS_DOF, 1> rhs = H.transpose() * residual / R;
+    const Eigen::Matrix<double, IKFOM_ACTIVE_MEAS_DOF, 1> u = A.colPivHouseholderQr().solve(rhs);
+    const Eigen::VectorXd innovation_weighted = (residual - H * (P_active * u)) / R;
+    const double nis = residual.dot(innovation_weighted);
+    if (!std::isfinite(nis))
+    {
+        return;
+    }
+
+    const Eigen::Matrix<double, IKFOM_ACTIVE_MEAS_DOF, IKFOM_ACTIVE_MEAS_DOF> fim_sym =
+        0.5 * (fim + fim.transpose());
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, IKFOM_ACTIVE_MEAS_DOF, IKFOM_ACTIVE_MEAS_DOF>> eig(fim_sym);
+
+    fast_lio::EstimatorMetrics msg;
+    msg.header.stamp = stamp;
+    msg.header.frame_id = "camera_init";
+    msg.effective_features = effct_feat_num;
+    msg.measurement_dof = dof;
+    msg.active_state_dim = IKFOM_ACTIVE_MEAS_DOF;
+    msg.measurement_noise = R;
+    msg.residual_mean = residual.mean();
+    msg.residual_abs_mean = residual.array().abs().mean();
+    msg.residual_rms = std::sqrt(residual.squaredNorm() / static_cast<double>(dof));
+    msg.nis = nis;
+    msg.nis_per_dof = nis / static_cast<double>(dof);
+    msg.fim_trace = fim.trace();
+    msg.fim_min_eigenvalue = eig.info() == Eigen::Success ? eig.eigenvalues()(0) : 0.0;
+    msg.fim_max_eigenvalue = eig.info() == Eigen::Success ? eig.eigenvalues()(IKFOM_ACTIVE_MEAS_DOF - 1) : 0.0;
+    for (int i = 0; i < IKFOM_ACTIVE_MEAS_DOF; i++)
+    {
+        msg.fim_diag[i] = fim(i, i);
+    }
+    pubMetrics.publish(msg);
 }
 
 void publish_path(const ros::Publisher pubPath)
@@ -987,6 +1059,7 @@ int main(int argc, char** argv)
     nh.param<double>("mapping/acc_cov",acc_cov,0.1);
     nh.param<double>("mapping/b_gyr_cov",b_gyr_cov,0.0001);
     nh.param<double>("mapping/b_acc_cov",b_acc_cov,0.0001);
+    nh.param<bool>("mapping/gravity_align_en", gravity_align_en, true);
     nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
     nh.param<int>("preprocess/lidar_type", lidar_type, AVIA);
     nh.param<int>("preprocess/scan_line", p_pre->N_SCANS, 16);
@@ -1031,12 +1104,14 @@ int main(int argc, char** argv)
     p_imu_map->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
     p_imu_map->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu_map->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+    p_imu_map->set_gravity_align(gravity_align_en);
     p_imu_map->lidar_type = lidar_type;
     p_imu_odom->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
     p_imu_odom->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
     p_imu_odom->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
     p_imu_odom->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu_odom->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+    p_imu_odom->set_gravity_align(gravity_align_en);
     p_imu_odom->lidar_type = lidar_type;
     double epsi[23] = {0.001};
     fill(epsi, epsi+23, 0.001);
@@ -1080,6 +1155,8 @@ int main(int argc, char** argv)
     // IMU-rate odometry publisher (separate topic)
     pubOdomImu = nh.advertise<nav_msgs::Odometry>
             ("/Odometry_imu", 200000);
+    pubEstimatorMetrics = nh.advertise<fast_lio::EstimatorMetrics>
+            ("/estimator_metrics", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
     ros::Publisher pubPlaneNormals  = nh.advertise<visualization_msgs::Marker>
@@ -1228,6 +1305,7 @@ int main(int argc, char** argv)
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
+            publish_estimator_metrics(pubEstimatorMetrics, ros::Time().fromSec(lidar_end_time));
             publish_plane_normal_markers(pubPlaneNormals);
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();

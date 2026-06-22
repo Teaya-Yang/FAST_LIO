@@ -49,6 +49,7 @@ class ImuProcess
   void set_acc_cov(const V3D &scaler);
   void set_gyr_bias_cov(const V3D &b_g);
   void set_acc_bias_cov(const V3D &b_a);
+  void set_gravity_align(bool enable);
   Eigen::Matrix<double, 12, 12> Q;
   void Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 12, input_ikfom> &kf_state, PointCloudXYZI::Ptr pcl_un_);
   // IMU-only propagation for a single IMU measurement, used for IMU-rate odometry.
@@ -97,6 +98,7 @@ class ImuProcess
   // dt is computed purely from IMU timestamps, independent of sync_packages.
   double imu_only_last_time_;
   bool   imu_only_ready_;
+  bool   gravity_align_en_;
   int    init_iter_num = 1;
   bool   b_first_frame_ = true;
   bool   imu_need_init_ = true;
@@ -120,6 +122,7 @@ ImuProcess::ImuProcess()
   last_imu_imu_odom_.reset();
   imu_only_last_time_ = 0.0;
   imu_only_ready_     = false;
+  gravity_align_en_   = true;
 }
 
 ImuProcess::~ImuProcess() {}
@@ -140,6 +143,11 @@ void ImuProcess::Reset()
   cur_pcl_un_.reset(new PointCloudXYZI());
   imu_only_last_time_ = 0.0;
   imu_only_ready_     = false;
+}
+
+void ImuProcess::set_gravity_align(bool enable)
+{
+  gravity_align_en_ = enable;
 }
 
 void ImuProcess::set_extrinsic(const MD(4,4) &T)
@@ -201,6 +209,7 @@ void ImuProcess::copy_imu_odom_calibration_from(const ImuProcess &map_proc)
   cov_gyr_scale  = map_proc.cov_gyr_scale;
   cov_bias_gyr   = map_proc.cov_bias_gyr;
   cov_bias_acc   = map_proc.cov_bias_acc;
+  gravity_align_en_ = map_proc.gravity_align_en_;
   first_lidar_time = map_proc.first_lidar_time;
   imu_need_init_ = false;
   last_imu_imu_odom_.reset();
@@ -312,7 +321,25 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, esekfom::esekf<state_ikfom, 
     N ++;
   }
   state_ikfom init_state = kf_state.get_x();
-  init_state.grav = S2(- mean_acc / mean_acc.norm() * G_m_s2);
+  const double mean_acc_norm = mean_acc.norm();
+  const bool mean_acc_valid = std::isfinite(mean_acc_norm) && mean_acc_norm > 1.0e-6;
+  if (gravity_align_en_ && mean_acc_valid)
+  {
+    const V3D acc_dir = mean_acc / mean_acc_norm;
+    const Eigen::Quaterniond q_align =
+        Eigen::Quaterniond::FromTwoVectors(acc_dir, V3D::UnitZ()).normalized();
+    init_state.rot = SO3(q_align.toRotationMatrix());
+    init_state.grav = S2(0.0, 0.0, -G_m_s2);
+  }
+  else
+  {
+    if (gravity_align_en_)
+    {
+      ROS_WARN("Invalid mean accelerometer norm during gravity alignment; using identity attitude initialization.");
+    }
+    init_state.grav = mean_acc_valid ? S2(- mean_acc / mean_acc_norm * G_m_s2)
+                                     : S2(0.0, 0.0, -G_m_s2);
+  }
   
   //state_inout.rot = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
   init_state.bg  = mean_gyr;
