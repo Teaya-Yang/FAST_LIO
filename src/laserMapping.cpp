@@ -402,18 +402,18 @@ void fill_ros_pose_covariance(const EkfCov &P, CovArray &cov)
 }
 
 template<typename CovArray>
-void fill_ros_twist_covariance(const state_ikfom &s, const EkfCov &P, CovArray &cov)
+void fill_ros_twist_covariance(const EkfCov &P, CovArray &cov)
 {
     clear_ros_covariance(cov);
-    const M3D R = s.rot.toRotationMatrix();
+    // Match the lab twist convention: linear velocity in world axes, angular
+    // velocity in body axes. The EKF velocity covariance already uses world axes.
     const M3D sigma_v_world = P.block<3, 3>(IKFOM_IDX_VEL, IKFOM_IDX_VEL);
-    const M3D sigma_v_body = R.transpose() * sigma_v_world * R;
 
     for (int r = 0; r < 3; r++)
     {
         for (int c = 0; c < 3; c++)
         {
-            cov[r * 6 + c] = sigma_v_body(r, c);
+            cov[r * 6 + c] = sigma_v_world(r, c);
             cov[(r + 3) * 6 + (c + 3)] = P(IKFOM_IDX_BG + r, IKFOM_IDX_BG + c);
         }
     }
@@ -437,10 +437,12 @@ void fill_odometry_msg(nav_msgs::Odometry &odom,
     odom.pose.pose.orientation.z = s.rot.coeffs()[2];
     odom.pose.pose.orientation.w = s.rot.coeffs()[3];
 
-    const V3D vel_body = s.rot.conjugate() * s.vel;
-    odom.twist.twist.linear.x = vel_body(0);
-    odom.twist.twist.linear.y = vel_body(1);
-    odom.twist.twist.linear.z = vel_body(2);
+    // Lab controller convention: world-frame linear velocity, body-frame angular
+    // velocity. Both /Odometry and /Odometry_imu use this helper. The child frame
+    // still identifies the body pose; twist.linear intentionally uses camera_init.
+    odom.twist.twist.linear.x = s.vel(0);
+    odom.twist.twist.linear.y = s.vel(1);
+    odom.twist.twist.linear.z = s.vel(2);
 
     const V3D omega_body = gyro - s.bg;
     odom.twist.twist.angular.x = omega_body(0);
@@ -448,7 +450,7 @@ void fill_odometry_msg(nav_msgs::Odometry &odom,
     odom.twist.twist.angular.z = omega_body(2);
 
     fill_ros_pose_covariance(P, odom.pose.covariance);
-    fill_ros_twist_covariance(s, P, odom.twist.covariance);
+    fill_ros_twist_covariance(P, odom.twist.covariance);
 }
 
 void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
